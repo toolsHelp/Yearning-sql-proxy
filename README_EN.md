@@ -1,5 +1,7 @@
 # sql-relay — Read-Only SQL Relay Proxy
 
+[![CI](https://github.com/toolsHelp/Yearning-sql-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/toolsHelp/Yearning-sql-proxy/actions/workflows/ci.yml)
+
 Program name: `sql-relay` (repository name: Yearning-sql-proxy — both refer to the same project).
 中文版: [README.md](README.md)
 

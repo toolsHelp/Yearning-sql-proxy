@@ -1,5 +1,7 @@
 # sql-relay — 只读 SQL 中转代理
 
+[![CI](https://github.com/toolsHelp/Yearning-sql-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/toolsHelp/Yearning-sql-proxy/actions/workflows/ci.yml)
+
 程序名 `sql-relay`（仓库名 Yearning-sql-proxy，二者指同一个项目）。
 English: [README_EN.md](README_EN.md)
 

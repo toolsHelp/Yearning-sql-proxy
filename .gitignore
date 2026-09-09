@@ -1,6 +1,7 @@
 # 编译产物
 /sql-relay
 sql-relay-*
+dist/
 *.exe
 
 # 本地配置覆盖（含真实口令，勿提交）
