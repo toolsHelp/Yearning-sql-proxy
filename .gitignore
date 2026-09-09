@@ -1,0 +1,15 @@
+# 编译产物
+/sql-relay
+sql-relay-*
+*.exe
+
+# 本地配置覆盖（含真实口令，勿提交）
+config.local.yaml
+
+# 日志
+*.log
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store

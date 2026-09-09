@@ -1,0 +1,25 @@
+# ============================================================
+# sql-relay 只读 SQL 中转代理 —— 配置文件模板
+# 使用前请把下面所有 <占位符> 替换成你自己的真实值。
+# ============================================================
+
+listen: 127.0.0.1:3307          # 本地 MySQL 协议监听地址（仅回环，防本机外进程直连）
+server_version: "5.7.36"        # 伪装的服务端版本，促使客户端用 mysql_native_password
+
+proxy_password: "<改成你自己的连接口令>"   # DataGrip 里 password 字段填这个口令（本地鉴权）
+
+yearning:
+  base_url: "http://<你的-yearning-后端地址>"   # Yearning 后端地址（http/https，ws/wss 自动推导）
+  auth_mode: "ldap"             # ldap -> POST /ldap；general -> POST /login
+  login_user: "<你的-yearning-账号>"
+  login_password: "<你的-yearning-密码>"
+  is_ldap: true                 # 与 Yearning /ldap 入参一致
+  is_oidc: false
+
+# 说明：DataGrip 的 user 字段直接填 Yearning 数据源名（如 gaia_purchase_order）。
+# 代理会加载账号下有权限的所有数据库，按库名自动路由到对应数据源。
+
+timeout:
+  query: 120s                    # 单次查询超时
+  connect: 20s                   # HTTP/WebSocket 建连超时
+  metadata_cache: 5m             # information_schema 表结构元数据本地缓存 TTL
