@@ -2,16 +2,19 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 
+	"github.com/toolsHelp/Yearning-sql-proxy/internal/audit"
 	"github.com/toolsHelp/Yearning-sql-proxy/internal/classifier"
 	"github.com/toolsHelp/Yearning-sql-proxy/internal/config"
 	"github.com/toolsHelp/Yearning-sql-proxy/internal/metacache"
@@ -22,6 +25,18 @@ import (
 
 // regexShowDB 匹配 SHOW DATABASES。
 var regexShowDB = regexp.MustCompile(`(?i)^show\s+databases\s*;?$`)
+
+// reSchemaFilter 匹配 information_schema 查询里的库名过滤条件。
+//
+// 覆盖各类 *_schema 列（table_schema / routine_schema / trigger_schema /
+// event_schema / specific_schema / schema_name 等），两个捕获组分别对应
+// `= '库'` 与 `in ('库', ...)` 两种写法。
+//
+// 关键约束：值必须带引号（或以数字开头），否则会把 `T.table_schema = V.table_schema`
+// 这类 JOIN 条件里的列标识符误当成库名。DataGrip 的「Retrieve Tables and Views」
+// 正是这种写法，一旦误判就会去查一个不存在的库、返回 0 行。
+var reSchemaFilter = regexp.MustCompile(
+	`(?i)[a-z_]*schema(?:_name)?\s*\)?\s*(?:=\s*['"\x60]([A-Za-z0-9_$]+)['"\x60]|in\s*\(\s*['"\x60]([A-Za-z0-9_$]+)['"\x60])`)
 
 // Handler 是每个客户端连接独享的 handler 实例，
 // 记录该连接的 DataGrip user（Yearning 数据源名）与后端会话。
@@ -34,9 +49,12 @@ type Handler struct {
 	mu       sync.Mutex
 	sessions map[string]*yearning.QuerySession // source_id -> 会话
 	schema   string                            // 当前 USE 的库名
+	connID   uint32                            // go-mysql 连接 ID，用于审计关联
 
 	// 表结构元数据缓存（进程级，跨连接共享）
 	meta *metacache.Cache
+	// 请求审计日志，nil 表示未启用。
+	aud *audit.Logger
 }
 
 // NewHandler 构造一个连接到 yearn 的连接 handler。
@@ -53,15 +71,48 @@ func (h *Handler) SetUser(user string) {
 	h.user = user
 }
 
-// sessionFor 返回（必要时新建）指定 source_id 的查询会话。
-func (h *Handler) sessionFor(sourceID string) (*yearning.QuerySession, error) {
+// SetConnID 写入 go-mysql 的连接 ID，供审计事件关联同一连接。
+func (h *Handler) SetConnID(id uint32) {
+	h.mu.Lock()
+	h.connID = id
+	h.mu.Unlock()
+}
+
+// SetAudit 绑定审计日志（nil 表示不记录）。
+func (h *Handler) SetAudit(l *audit.Logger) {
+	h.mu.Lock()
+	h.aud = l
+	h.mu.Unlock()
+}
+
+// auditLogger 取当前审计日志（可为 nil）。
+func (h *Handler) auditLogger() *audit.Logger {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.aud
+}
+
+// rec 记录一条审计事件；未启用审计时为空操作。
+func (h *Handler) rec(e *audit.Event) {
+	if l := h.auditLogger(); l != nil {
+		l.Record(*e)
+	}
+}
+
+// sessionFor 返回（必要时新建）指定 source_id 的查询会话。
+//
+// 建连（握手 + 可能的重新登录）可能耗时数百毫秒，聚合模式下还要为多个数据源
+// 建连，因此不能持 h.mu 做这件事，否则会阻塞同一连接上的其它查询。
+func (h *Handler) sessionFor(sourceID string) (*yearning.QuerySession, error) {
+	h.mu.Lock()
 	if qs, ok := h.sessions[sourceID]; ok && !qs.IsDead() {
+		h.mu.Unlock()
 		return qs, nil
 	}
-	// 已死或不存在：清理后重建。
+	// 已死或不存在：清理后重建。先释放锁再建连。
 	h.dropSessionLocked(sourceID)
+	h.mu.Unlock()
+
 	qs, err := h.yc.NewQuerySession(sourceID)
 	if err != nil {
 		// 可能是 token 过期，清缓存重试一次。
@@ -70,6 +121,14 @@ func (h *Handler) sessionFor(sourceID string) (*yearning.QuerySession, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// 并发建连时以先放入的为准，多余的连接关掉，避免同一 source 多个会话并存。
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if existing, ok := h.sessions[sourceID]; ok && !existing.IsDead() {
+		qs.Close()
+		return existing, nil
 	}
 	h.sessions[sourceID] = qs
 	return qs, nil
@@ -104,8 +163,54 @@ func (h *Handler) resolveSource(schema string) (string, error) {
 			return id, nil
 		}
 	}
-	// 退回：用 user（数据源名）解析。
-	return h.yc.ResolveSourceID(h.user)
+	// 退回：按 user 匹配数据源名（兼容为每个数据源单独建连接的用法）。
+	if h.user != "" {
+		if id, err := h.yc.ResolveSourceID(h.user); err == nil {
+			return id, nil
+		}
+	}
+
+	// 聚合模式：user 留空、填库名或填了不认识的名字时，不报错，
+	// 从全局「库名→数据源」映射里取一个可用数据源兜底。
+	// 这样用户在 DataGrip 里只配一个连接，就能看到账号下有权限的所有库。
+	sm, err := h.yc.SchemaMap()
+	if err != nil {
+		return "", fmt.Errorf("加载数据源与库列表失败: %w", err)
+	}
+	if len(sm) == 0 {
+		return "", fmt.Errorf("当前账号没有可查询的库，请检查 Yearning 权限配置")
+	}
+	// user 恰好是库名时优先用该库所属数据源。
+	if id, ok := pickSchemaSource(sm, h.user); ok {
+		log.Printf("user %q 未匹配数据源名，按库名解析到 source_id=%s", h.user, id)
+		return id, nil
+	}
+	// 否则任选一个（按库名排序取第一个，保证结果稳定）。
+	names := make([]string, 0, len(sm))
+	for name := range sm {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	id := sm[names[0]]
+	log.Printf("user %q 未匹配数据源名，聚合模式选用 source_id=%s（库 %s）", h.user, id, names[0])
+	return id, nil
+}
+
+// pickSchemaSource 在库名→数据源映射里按库名取数据源（大小写不敏感）。
+func pickSchemaSource(sm map[string]string, name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	if id, ok := sm[name]; ok {
+		return id, true
+	}
+	lower := strings.ToLower(name)
+	for schema, id := range sm {
+		if strings.ToLower(schema) == lower {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 // myError 把普通字符串转成 MySQL 错误（透传给 DataGrip）。
@@ -113,29 +218,123 @@ func myError(code uint16, msg string) error {
 	return mysql.NewError(code, msg)
 }
 
+// queryError 把底层错误转成给客户端的 MySQL 错误。
+// 连接类错误给出可重试的提示，避免把 Go 的 websocket 错误原文直接抛给 DataGrip。
+func queryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var me *mysql.MyError
+	if errors.As(err, &me) {
+		return me
+	}
+	if yearning.IsConnError(err) {
+		return myError(1105, "与 Yearning 的连接已断开，请重试该查询")
+	}
+	return myError(1105, err.Error())
+}
+
+// connIDLocked 读取本连接的 go-mysql 连接 ID。
+func (h *Handler) connIDLocked() uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.connID
+}
+
+// rowsOf 取结果集行数，便于审计判断返回是否为空。
+func rowsOf(res *mysql.Result) int {
+	if res == nil || res.Resultset == nil {
+		return 0
+	}
+	return len(res.Values)
+}
+
+// errInfo 拆出 MySQL 错误码与错误信息，供审计分类统计。
+func errInfo(err error) (uint16, string) {
+	if err == nil {
+		return 0, ""
+	}
+	return errCodeOf(err), err.Error()
+}
+
+// errCodeOf 提取 MySQL 错误码（非 MySQL 错误返回 0）。
+func errCodeOf(err error) uint16 {
+	if err == nil {
+		return 0
+	}
+	var me *mysql.MyError
+	if errors.As(err, &me) {
+		return me.Code
+	}
+	return 0
+}
+
 // UseDB 处理 COM_INIT_DB：记录当前库并放行。
 func (h *Handler) UseDB(dbName string) error {
 	h.mu.Lock()
 	h.schema = dbName
 	h.mu.Unlock()
+	h.rec(&audit.Event{
+		ConnID:   h.connIDLocked(),
+		User:     h.user,
+		Cmd:      audit.CmdInitDB,
+		Kind:     string(classifier.KindSessionUse),
+		Decision: audit.DecisionLocalUse,
+		Schema:   dbName,
+	})
 	return nil
 }
 
 // HandleQuery 处理 COM_QUERY：只读校验后转发 Yearning 执行。
+// 本方法只负责审计打点，真正的处理链路在 execQuery 中。
 func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
+	start := time.Now()
+	ev := &audit.Event{
+		Time:   start,
+		ConnID: h.connIDLocked(),
+		User:   h.user,
+		Cmd:    audit.CmdQuery,
+		SQL:    query,
+	}
+	var (
+		res *mysql.Result
+		d   audit.Decision
+		err error
+	)
+	defer func() {
+		ev.Decision = d
+		ev.Rows = rowsOf(res)
+		ev.LatencyMS = time.Since(start).Milliseconds()
+		ev.ErrCode, ev.Error = errInfo(err)
+		h.rec(ev)
+	}()
+	res, d, err = h.execQuery(query, ev)
+	return res, err
+}
+
+// execQuery 是 HandleQuery 的实现体，额外返回审计用的处理路径 Decision。
+// ev 会被填充 Kind / Schema / Source 三个字段。
+func (h *Handler) execQuery(query string, ev *audit.Event) (*mysql.Result, audit.Decision, error) {
 	log.Printf("查询[%s]: %s", h.user, query)
+	ev.Kind = string(classifier.Classify(query, ""))
 	if err := classifier.CheckReadOnly(query); err != nil {
 		log.Printf("查询被拦截: %v", err)
-		return nil, err
+		return nil, audit.DecisionRejected, err
 	}
 
 	// 多条语句拆开逐条执行；DataGrip 默认单语句，这里取第一条的结果。
 	stmts := classifier.SplitStatements(query)
 	if len(stmts) == 0 {
-		return nil, myError(1064, "空语句")
+		return nil, audit.DecisionError, myError(1064, "空语句")
 	}
 	q := stmts[0]
 	fw := classifier.FirstWord(q)
+	ev.Kind = string(classifier.Classify(q, fw))
+	// 压缩传输体积：Yearning 的查询 WS 对单条消息有大小限制（55KB 实测会被断连），
+	// DataGrip 格式化的长 SQL 压缩后通常能降 30%~60%。语义等价，字面量不动。
+	if shrunk := classifier.ShrinkSQL(q); len(shrunk) < len(q) {
+		q = shrunk
+	}
 
 	// USE 语句直接改本地记录的 schema，不转发给 Yearning 的 SQL 通道。
 	if strings.EqualFold(fw, "use") {
@@ -144,29 +343,37 @@ func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
 		h.mu.Lock()
 		h.schema = db
 		h.mu.Unlock()
-		return &mysql.Result{Status: 0x0002}, nil
+		ev.Schema = db
+		return &mysql.Result{Status: 0x0002}, audit.DecisionLocalUse, nil
 	}
 
 	// 本地会话语句（SET / 事务控制）在代理侧消化，不转发给 Yearning。
 	if isLocalSessionStmt(fw) {
-		return &mysql.Result{Status: 0x0002}, nil
+		return &mysql.Result{Status: 0x0002}, audit.DecisionLocalSession, nil
 	}
 
 	// 本地汇总：SHOW DATABASES / information_schema.SCHEMATA 返回全部数据源的所有库。
 	if r, handled := h.handleSchemaEnumeration(q, fw); handled {
-		return r, nil
+		return r, audit.DecisionLocalServed, nil
 	}
 
 	// 本地屏蔽：DataGrip 的「用户/权限/排序规则」等管理类元数据探测，
 	// Yearning 后端用受限账号，无这些系统表权限，转发会报错。返回空结果。
 	if r, handled := handleManageInfoQuery(q); handled {
-		return r, nil
+		return r, audit.DecisionLocalEmpty, nil
+	}
+
+	// 服务器特性探测：优先按伪装版本返回伪造值（SHOW VARIABLES / SELECT @@xx / VERSION() /
+	// DATABASE()）。此前一律返回空结果，客户端拿不到版本号会按未知版本降级。
+	if r, ok := h.fakeProbeResult(q, fw); ok {
+		log.Printf("本地伪造服务器探测: %s", strings.TrimSpace(q))
+		return r, audit.DecisionLocalServed, nil
 	}
 
 	// 本地屏蔽：系统变量/状态、information_schema 的 DDL 探测（SELECT @@xx / SHOW VARIABLES /
 	// SHOW CREATE VIEW information_schema.xxx 等），Yearning 查询引擎处理不了，返回空。
 	if handled := handleServerProbeQuery(q, fw); handled {
-		return emptyResult(), nil
+		return emptyResult(), audit.DecisionLocalEmpty, nil
 	}
 
 	// 改写：后端为 MySQL 5.6 时 information_schema.COLUMNS 没有 generation_expression 列，
@@ -183,38 +390,49 @@ func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
 		schema = db
 	}
 
-	srcID, err := h.resolveSource(schema)
+	ev.Schema = schema
+
+	// 该查询需要跨哪些数据源：SQL 里明确了库名就只查那个数据源，
+	// 否则（聚合模式下的全量内省查询）需要遍历所有可用数据源合并结果。
+	targets, err := h.targetSources(schema, q)
 	if err != nil {
-		return nil, myError(1044, err.Error())
+		return nil, audit.DecisionError, myError(1044, err.Error())
 	}
+	ev.Source = strings.Join(targets, ",")
 
 	// 元数据缓存：可缓存的 information_schema 结构查询优先命中本地。
-	if isCacheableMetaQuery(q) {
-		if r, ok := h.metaCacheGet(srcID, q); ok {
+	// 单源查询按 source_id 作 key；跨数据源聚合查询按固定前缀作 key——
+	// 没有这层缓存的话，DataGrip 每次内省都会对全部数据源打一遍聚合查询。
+	cacheable := isCacheableMetaQuery(q)
+	cacheKey := cacheKeyFor(targets)
+	if cacheable {
+		if r, ok := h.metaCacheGet(cacheKey, q); ok {
 			log.Printf("查询[%s] 命中元数据缓存: %.80s", h.user, q)
-			return r, nil
+			return r, audit.DecisionCacheHit, nil
 		}
 	}
 
-	be, err := h.sessionFor(srcID)
+	raw, ordered, err := h.execAcross(q, schema, targets)
 	if err != nil {
-		return nil, myError(1044, err.Error())
+		return nil, audit.DecisionError, queryError(err)
 	}
-
-	raw, err := h.execQueryRaw(be, srcID, q, schema)
-	if err != nil {
-		return nil, err
+	if logQueryDetail {
+		log.Printf("查询[%s] 原始结果: %d 个结果集, %d 个字段, %d 行 (sql=%.120s)",
+			h.user, len(raw.Results), rawFieldCount(raw), rawRowCount(raw), q)
 	}
 	res, err := resultset.Convert(raw)
 	if err != nil {
-		return nil, myError(1105, err.Error())
+		return nil, audit.DecisionError, myError(1105, err.Error())
 	}
 
 	// 成功结果写入缓存。
-	if isCacheableMetaQuery(q) {
-		h.metaCacheSet(srcID, q, raw)
+	if cacheable {
+		h.metaCacheSet(cacheKey, q, raw)
 	}
-	return res, nil
+	if ordered {
+		return res, audit.DecisionForwardedOrdered, nil
+	}
+	return res, audit.DecisionForwarded, nil
 }
 
 // handleManageInfoQuery 本地屏蔽 DataGrip 的管理类元数据探测（用户/权限/排序规则等），
@@ -323,9 +541,13 @@ func handleServerProbeQuery(q, firstWord string) bool {
 	lower := strings.ToLower(q)
 
 	// SHOW VARIABLES / SHOW GLOBAL|SESSION (VARIABLES|STATUS)
+	// 注意：不能用裸 " status" 匹配，否则 SHOW FUNCTION/PROCEDURE STATUS 会被误吞，
+	// 导致 DataGrip 的函数/存储过程节点永远为空。
 	if firstWord == "show" {
-		if strings.Contains(lower, "variables") || strings.Contains(lower, " status") ||
-			strings.Contains(lower, "global variables") || strings.Contains(lower, "session variables") {
+		if strings.Contains(lower, "show variables") ||
+			strings.Contains(lower, "session variables") || strings.Contains(lower, "global variables") ||
+			strings.Contains(lower, "show status") ||
+			strings.Contains(lower, "session status") || strings.Contains(lower, "global status") {
 			return true
 		}
 		// SHOW CREATE (VIEW|TABLE)：仅屏蔽系统对象（information_schema.* / mysql.*），
@@ -453,29 +675,54 @@ func (h *Handler) metaCacheSet(srcID, q string, raw *msgpack.QueryResults) {
 }
 
 // isCacheableMetaQuery 判断查询是否为可缓存的表结构元数据查询。
+//
+// 覆盖两条路径：
+//  1. information_schema 结构表查询；
+//  2. SHOW 语法的结构查询——真实抓包显示 DataGrip 2026.x 连接 5.7 服务端时
+//     完全不发 information_schema，只用 SHOW FULL TABLES / SHOW FULL COLUMNS /
+//     SHOW INDEX / SHOW CREATE TABLE，因此这部分必须一并缓存。
 func isCacheableMetaQuery(q string) bool {
 	lower := strings.ToLower(q)
-	if !strings.Contains(lower, "information_schema.") {
+	if strings.Contains(lower, "information_schema.") {
+		// 只缓存结构类表：tables / columns / statistics / key_column_usage / views /
+		// table_constraints / triggers / routines / parameters。
+		for _, t := range []string{
+			"information_schema.tables",
+			"information_schema.columns",
+			"information_schema.statistics",
+			"information_schema.key_column_usage",
+			"information_schema.views",
+			"information_schema.table_constraints",
+			"information_schema.triggers",
+			"information_schema.routines",
+			"information_schema.parameters",
+		} {
+			if strings.Contains(lower, t) {
+				// 排除带 UNION 的聚合查询（多 schema 跨库），缓存粒度不一致。
+				if strings.Contains(lower, "union") {
+					return false
+				}
+				return true
+			}
+		}
 		return false
 	}
-	// 只缓存结构类表：tables / columns / statistics / key_column_usage / views /
-	// table_constraints / triggers / routines / parameters。
-	for _, t := range []string{
-		"information_schema.tables",
-		"information_schema.columns",
-		"information_schema.statistics",
-		"information_schema.key_column_usage",
-		"information_schema.views",
-		"information_schema.table_constraints",
-		"information_schema.triggers",
-		"information_schema.routines",
-		"information_schema.parameters",
-	} {
-		if strings.Contains(lower, t) {
-			// 排除带 UNION 的聚合查询（多 schema 跨库），缓存粒度不一致。
-			if strings.Contains(lower, "union") {
-				return false
-			}
+	return isCacheableShowMeta(lower)
+}
+
+// cacheableShowPrefixes 是可缓存的 SHOW 结构查询前缀。
+var cacheableShowPrefixes = []string{
+	"show tables", "show full tables", "show open tables",
+	"show table status",
+	"show columns", "show full columns", "show fields", "show full fields",
+	"show index", "show indexes", "show keys",
+	"show create table", "show create view",
+}
+
+// isCacheableShowMeta 判断是否可缓存的 SHOW 结构查询（入参已小写）。
+func isCacheableShowMeta(lower string) bool {
+	for _, p := range cacheableShowPrefixes {
+		if strings.HasPrefix(lower, p) {
 			return true
 		}
 	}
@@ -520,8 +767,179 @@ func stripBlockComments(q string) string {
 	return q
 }
 
+// logQueryDetail 控制是否打印 Yearning 返回的原始结果规模。
+// 排查「表/字段加载不出来」时置为 true，可看到每条查询实际返回的行数。
+const logQueryDetail = false
+
+// rawFieldCount / rawRowCount 汇总 Yearning 原始结果的字段数与行数。
+func rawFieldCount(r *msgpack.QueryResults) int {
+	n := 0
+	for _, q := range r.Results {
+		n += len(q.Field)
+	}
+	return n
+}
+
+func rawRowCount(r *msgpack.QueryResults) int {
+	n := 0
+	for _, q := range r.Results {
+		n += len(q.Data)
+	}
+	return n
+}
+
+// targetSources 决定一条查询要打到哪些数据源。
+//
+//   - schema 有值：按「库名→数据源」映射定位；映射里没有该库时退化为 user 指定/兜底的数据源。
+//   - schema 为空且是 information_schema 结构查询：说明客户端在问「全部库」，
+//     需要遍历所有可用数据源后合并结果（聚合模式）。
+//   - 其余情况：单个数据源。
+func (h *Handler) targetSources(schema, q string) ([]string, error) {
+	if schema != "" {
+		if id, ok := h.yc.SourceBySchema(schema); ok {
+			return []string{id}, nil
+		}
+		// 映射是懒加载的（只有 SHOW DATABASES / 聚合路径才触发），首次遇到具体库名时
+		// 必须主动加载一次，否则会把该库的查询错误地兜底到别的数据源（查到 0 行）。
+		if _, err := h.yc.SchemaMap(); err != nil {
+			log.Printf("加载库→数据源映射失败: %v", err)
+		} else if id, ok := h.yc.SourceBySchema(schema); ok {
+			return []string{id}, nil
+		}
+		// 映射里确实没有这个库（新库或权限变化），退化为 user/兜底解析。
+		log.Printf("库 %q 不在账号可访问的库列表中，退化为 user 指定的数据源", schema)
+		id, err := h.resolveSource(schema)
+		if err != nil {
+			return nil, err
+		}
+		return []string{id}, nil
+	}
+
+	id, err := h.resolveSource("")
+	if err != nil {
+		return nil, err
+	}
+	if !needsAllSources(q) {
+		return []string{id}, nil
+	}
+	all := h.yc.AllSourceIDs()
+	if len(all) == 0 {
+		return []string{id}, nil
+	}
+	return all, nil
+}
+
+// needsAllSources 判断这条「无库名限定」的查询是否需要跨数据源取全量。
+// 仅限 information_schema 的结构元数据查询；业务查询仍走兜底数据源，
+// 否则会拖慢普通查询并产生大量无意义的后端请求。
+func needsAllSources(q string) bool {
+	lower := strings.ToLower(q)
+	if !strings.Contains(lower, "information_schema.") {
+		return false
+	}
+	return true
+}
+
+// aggregateCachePrefix 是跨数据源聚合查询结果在元数据缓存里的 key 前缀。
+const aggregateCachePrefix = "ALL"
+
+// cacheKeyFor 生成元数据缓存的 source 维度 key：
+// 单源用 source_id；多源聚合用固定前缀（同一 SQL 的聚合结果只算一次）。
+func cacheKeyFor(targets []string) string {
+	if len(targets) == 1 {
+		return targets[0]
+	}
+	return aggregateCachePrefix
+}
+
+// largeSQLThreshold 超过该长度（压缩后）的 SQL，若重连重试仍触发断连，
+// 判定为超出 Yearning 服务端消息大小限制，直接给出缩短提示而不再反复重试。
+const largeSQLThreshold = 32 * 1024
+
+// maxAggregateConcurrency 限制聚合查询时同时在途的「建连+查询」数量。
+// 过大会在 Yearning 服务端触发连接限制/登录限流（表现为 websocket close sent 风暴），
+// 过小则单条聚合查询耗时会明显上升。
+const maxAggregateConcurrency = 6
+
+// execAcross 在多个数据源上执行查询并合并结果（多数据源时做行级 UNION）。
+func (h *Handler) execAcross(q, schema string, targets []string) (*msgpack.QueryResults, bool, error) {
+	if len(targets) == 1 {
+		id := targets[0]
+		be, err := h.sessionFor(id)
+		if err != nil {
+			return nil, false, myError(1044, err.Error())
+		}
+		return h.execQueryRaw(be, id, q, schema)
+	}
+
+	// 并发查询各数据源：串行时 27 个数据源要累加各自的往返耗时（实测单条可达数秒）。
+	// 用信号量限制同时在途的「建连+查询」，避免几十条 WebSocket 同时握手
+	// 触发 Yearning 服务端的连接限制或登录限流（表现为 close sent 风暴）。
+	// 每个数据源独立建连/查询，结果按 targets 顺序回填以保持输出稳定。
+	type outcome struct {
+		raw *msgpack.QueryResults
+		ord bool
+		err error
+	}
+	sem := make(chan struct{}, maxAggregateConcurrency)
+	outcomes := make([]outcome, len(targets))
+	var wg sync.WaitGroup
+	for i, id := range targets {
+		wg.Add(1)
+		go func(i int, id string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			be, err := h.sessionFor(id)
+			if err != nil {
+				outcomes[i].err = err
+				return
+			}
+			raw, ord, err := h.execQueryRaw(be, id, q, schema)
+			outcomes[i] = outcome{raw: raw, ord: ord, err: err}
+		}(i, id)
+	}
+	wg.Wait()
+
+	merged := &msgpack.QueryResults{}
+	var (
+		ordered  bool
+		firstErr error
+		okCount  int
+	)
+	for i, id := range targets {
+		o := outcomes[i]
+		if o.err != nil {
+			// 单个数据源失败（无该库权限、会话失效等）不应让整条查询失败。
+			log.Printf("聚合查询在数据源 %s 上失败，已跳过: %v", id, o.err)
+			if firstErr == nil {
+				firstErr = o.err
+			}
+			continue
+		}
+		if o.ord {
+			ordered = true
+		}
+		if merged.QueryTime < o.raw.QueryTime {
+			merged.QueryTime = o.raw.QueryTime
+		}
+		merged.Results = append(merged.Results, o.raw.Results...)
+		okCount++
+	}
+	if okCount == 0 {
+		if firstErr != nil {
+			return nil, ordered, firstErr
+		}
+		return nil, ordered, myError(1105, "所有数据源均未返回结果集")
+	}
+	log.Printf("聚合查询: %d/%d 个数据源返回结果, 合并 %d 个结果集",
+		okCount, len(targets), len(merged.Results))
+	return merged, ordered, nil
+}
+
 // execQueryRaw 执行查询（含断连重连 + 查询工单自动提交），返回原始 Yearning 结果。
-func (h *Handler) execQueryRaw(be *yearning.QuerySession, srcID, q, schema string) (*msgpack.QueryResults, error) {
+// 第二个返回值为 true 表示本次触发了自动提交查询工单。
+func (h *Handler) execQueryRaw(be *yearning.QuerySession, srcID, q, schema string) (*msgpack.QueryResults, bool, error) {
 	res, err := be.Exec(q, schema)
 	if err != nil {
 		// 连接类错误：丢弃失效会话、重连并重试一次。
@@ -530,21 +948,28 @@ func (h *Handler) execQueryRaw(be *yearning.QuerySession, srcID, q, schema strin
 			h.dropSession(srcID)
 			nb, e2 := h.sessionFor(srcID)
 			if e2 != nil {
-				return nil, myError(1105, fmt.Sprintf("查询失败且重连失败: %v", e2))
+				return nil, false, myError(1105, fmt.Sprintf("查询失败且重连失败: %v", e2))
 			}
 			res, err = nb.Exec(q, schema)
 			if err != nil {
 				log.Printf("查询[%s] 重连后仍失败: %v", h.user, err)
-				return nil, myError(1105, fmt.Sprintf("查询失败: %v", err))
+				// 新会话上发同一条 SQL 又立刻断连：确定性失败，多半是 SQL 超出
+				// Yearning 服务端的消息大小限制，重试没有意义，给出明确提示。
+				if yearning.IsConnError(err) && len(q) > largeSQLThreshold {
+					return nil, false, myError(1105,
+						fmt.Sprintf("SQL 过大（压缩后 %d 字符），Yearning 服务端拒绝处理并断开了连接，请缩短 SQL（如拆分大 IN 列表）", len(q)))
+				}
+				// 保留原始错误（%w），使上层仍能识别连接类错误并跳过该数据源。
+				return nil, false, fmt.Errorf("重连后查询仍失败: %w", err)
 			}
 		} else {
 			log.Printf("查询[%s] 执行失败: %v", h.user, err)
-			return nil, myError(1105, fmt.Sprintf("查询失败: %v", err))
+			return nil, false, fmt.Errorf("查询失败: %w", err)
 		}
 	}
 	if res.Error != "" {
 		log.Printf("查询[%s] Yearning 返回错误: %s", h.user, res.Error)
-		return nil, myError(1105, res.Error)
+		return nil, false, myError(1105, res.Error)
 	}
 	if res.Status {
 		log.Printf("查询[%s] 工单未批准，尝试自动提交查询工单 (source_id=%s)", h.user, srcID)
@@ -553,29 +978,37 @@ func (h *Handler) execQueryRaw(be *yearning.QuerySession, srcID, q, schema strin
 		}
 		res2, err2 := be.Exec(q, schema)
 		if err2 != nil {
-			return nil, myError(1105, fmt.Sprintf("查询失败: %v", err2))
+			return nil, true, myError(1105, fmt.Sprintf("查询失败: %v", err2))
 		}
 		if res2 != nil && res2.Error != "" {
-			return nil, myError(1105, res2.Error)
+			return nil, true, myError(1105, res2.Error)
 		}
 		if res2 == nil || res2.Status {
-			return nil, myError(1227, "已提交查询工单，请等待审批通过后再查询（审核开启时需 Yearning 审批人批准）")
+			return nil, true, myError(1227, "已提交查询工单，请等待审批通过后再查询（审核开启时需 Yearning 审批人批准）")
 		}
 		if len(res2.Results) == 0 {
-			return nil, myError(1105, "Yearning 未返回结果集")
+			return nil, true, myError(1105, "Yearning 未返回结果集")
 		}
-		return res2, nil
+		return res2, true, nil
 	}
 	if len(res.Results) == 0 {
-		return nil, myError(1105, "Yearning 未返回结果集")
+		return nil, false, myError(1105, "Yearning 未返回结果集")
 	}
-	return res, nil
+	return res, false, nil
 }
 
 // HandleFieldList 处理 COM_FIELD_LIST。
 // DataGrip 补全主要靠 information_schema / SHOW（走 HandleQuery）；
 // COM_FIELD_LIST 在标准客户端极少被使用，返回占位字段避免报错。
 func (h *Handler) HandleFieldList(table string, fieldWildcard string) ([]*mysql.Field, error) {
+	h.rec(&audit.Event{
+		ConnID:   h.connIDLocked(),
+		User:     h.user,
+		Cmd:      audit.CmdFieldList,
+		Kind:     string(classifier.KindFieldList),
+		Decision: audit.DecisionLocalFake,
+		SQL:      table + " " + fieldWildcard,
+	})
 	return []*mysql.Field{
 		{Name: []byte(""), OrgName: []byte(""), Table: []byte(table),
 			Charset: 33, Type: mysql.MYSQL_TYPE_VAR_STRING},
@@ -585,8 +1018,26 @@ func (h *Handler) HandleFieldList(table string, fieldWildcard string) ([]*mysql.
 // HandleStmtPrepare 处理 COM_STMT_PREPARE：只读校验 + 记录语句。
 func (h *Handler) HandleStmtPrepare(query string) (int, int, interface{}, error) {
 	if err := classifier.CheckReadOnly(query); err != nil {
+		h.rec(&audit.Event{
+			ConnID:   h.connIDLocked(),
+			User:     h.user,
+			Cmd:      audit.CmdStmtPrepare,
+			Kind:     string(classifier.Classify(query, "")),
+			Decision: audit.DecisionRejected,
+			SQL:      query,
+			ErrCode:  errCodeOf(err),
+			Error:    err.Error(),
+		})
 		return 0, 0, nil, err
 	}
+	h.rec(&audit.Event{
+		ConnID:   h.connIDLocked(),
+		User:     h.user,
+		Cmd:      audit.CmdStmtPrepare,
+		Kind:     string(classifier.Classify(query, "")),
+		Decision: audit.DecisionPrepared,
+		SQL:      query,
+	})
 	// 参数数量由占位符个数估算；列数未知先给 0。
 	return strings.Count(query, "?"), 0, query, nil
 }
@@ -604,7 +1055,18 @@ func (h *Handler) HandleStmtClose(context interface{}) error {
 
 // HandleOtherCommand 拒绝未支持的命令。
 func (h *Handler) HandleOtherCommand(cmd byte, data []byte) error {
-	return myError(1227, fmt.Sprintf("只读代理: 不支持的命令 0x%02x", cmd))
+	err := myError(1227, fmt.Sprintf("只读代理: 不支持的命令 0x%02x", cmd))
+	// 计数这类命令（如 JDBC 的 COM_SET_OPTION）有助于判断客户端是否被降级。
+	h.rec(&audit.Event{
+		ConnID:   h.connIDLocked(),
+		User:     h.user,
+		Cmd:      audit.CmdName(cmd),
+		Kind:     string(classifier.KindUnknown),
+		Decision: audit.DecisionUnsupported,
+		ErrCode:  errCodeOf(err),
+		Error:    err.Error(),
+	})
+	return err
 }
 
 // Close 释放后端会话。
@@ -725,39 +1187,43 @@ func isIdentChar(c byte) bool {
 //   - `SHOW TABLES/COLUMNS/... FROM 库`
 //   - `库.表` 前缀（FROM/JOIN/UPDATE/INTO 后）
 func extractTargetSchema(q string) string {
-	// 1) WHERE xxx TABLE_SCHEMA = '库' / SCHEMA_NAME = '库'（优先）
-	lower := strings.ToLower(q)
-	for _, key := range []string{"table_schema", "schema_name"} {
-		idx := strings.Index(lower, key)
-		for idx >= 0 {
-			rest := strings.TrimSpace(q[idx+len(key):])
-			if strings.HasPrefix(rest, "=") {
-				val := readQuoted(rest[1:])
-				if isRealSchema(val) {
-					return val
-				}
+	// 1) information_schema 查询里的库名过滤条件（优先），覆盖 DataGrip 的多种写法：
+	//      WHERE T.table_schema = '库'
+	//      WHERE lower(table_schema) = '库'
+	//      WHERE t.table_schema='库'        （无空格）
+	//      WHERE table_schema in ('库')
+	for _, m := range reSchemaFilter.FindAllStringSubmatch(q, -1) {
+		for _, g := range m[1:] {
+			if g != "" && isRealSchema(g) {
+				return g
 			}
-			n := strings.Index(lower[idx+len(key):], key)
-			if n < 0 {
-				break
-			}
-			idx += len(key) + n
 		}
 	}
 
-	// 2) SHOW TABLES/COLUMNS/... FROM 库
+	// 2) SHOW TABLES / SHOW COLUMNS / SHOW INDEX ... FROM 库
+	//    注意形如 `SHOW COLUMNS FROM 表 FROM 库` 的语句有两个 FROM，库名在最后一个；
+	//    若只有一个 FROM 且是列/索引类查询，那个标识符是表名而非库名，不应覆盖当前 schema。
 	upper := strings.ToUpper(q)
-	if strings.Contains(upper, "SHOW TABLES") || strings.Contains(upper, "SHOW FULL TABLES") ||
-		strings.Contains(upper, "SHOW COLUMNS") || strings.Contains(upper, "SHOW FIELDS") {
-		if idx := strings.Index(upper, " FROM "); idx >= 0 {
-			rest := strings.TrimSpace(q[idx+len(" FROM "):])
+	// 用 " 关键词"（前导空格）匹配，才能覆盖 SHOW FULL TABLES / SHOW FULL COLUMNS 这类带修饰的写法。
+	isTableListShow := strings.HasPrefix(upper, "SHOW ") && strings.Contains(upper, " TABLES")
+	isColOrIdxShow := strings.HasPrefix(upper, "SHOW ") &&
+		(strings.Contains(upper, " COLUMNS") || strings.Contains(upper, " FIELDS") ||
+			strings.Contains(upper, " INDEX") || strings.Contains(upper, " INDEXES") ||
+			strings.Contains(upper, " KEYS"))
+	if isTableListShow || isColOrIdxShow {
+		first := strings.Index(upper, " FROM ")
+		last := strings.LastIndex(upper, " FROM ")
+		if last >= 0 {
+			rest := strings.TrimSpace(q[last+len(" FROM "):])
 			// 优先级：限定的 `库.表`
 			if qual := readQualifier(rest); qual != "" && isRealSchema(qual) {
 				return qual
 			}
-			// 无点号：整个标识符就是库名
-			ident := readIdent(rest)
-			if ident != "" && isRealSchema(ident) {
+			// 列/索引查询只有一个 FROM 时，该标识符是表名（如 SHOW COLUMNS FROM t）
+			if isColOrIdxShow && last == first {
+				return ""
+			}
+			if ident := readIdent(rest); ident != "" && isRealSchema(ident) {
 				return strings.Trim(ident, "`")
 			}
 		}

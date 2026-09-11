@@ -23,3 +23,11 @@ timeout:
   query: 120s                    # 单次查询超时
   connect: 20s                   # HTTP/WebSocket 建连超时
   metadata_cache: 5m             # information_schema 表结构元数据本地缓存 TTL
+
+# 请求审计：抓取客户端实际发出的 SQL 及代理的处理方式，用于生成支持度矩阵。
+# 默认关闭；只在需要排查「DataGrip 补全/内省为什么不全」时临时打开。
+audit:
+  enabled: false                 # true = 每条命令追加一行 JSON 到 path
+  path: "sql-relay-audit.jsonl"  # 审计日志（JSONL），启动时追加不清空
+  max_sql: 512                   # 单条 SQL 记录的最大字符数，超出截断
+  keep_literals: false           # true = 保留 SQL 字面量原文（可能含业务数据）

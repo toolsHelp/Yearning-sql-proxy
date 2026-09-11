@@ -12,8 +12,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// errTimeout 表示查询等待超时。
+// errTimeout 表示查询等待超时（本次查询本身失败，连接可能仍然可用）。
 var errTimeout = errors.New("查询等待超时")
+
+// errClosed 表示底层 WebSocket 已关闭，会话需要重建。
+var errClosed = errors.New("会话已关闭")
 
 // binaryMessage / textMessage 是 gorilla websocket 的消息类型常量转写，
 // 避免在业务代码里直接引入 gorilla 的类型。
@@ -65,7 +68,7 @@ func dial(url, token, origin string, timeout time.Duration) (*gorillaConn, error
 	}
 	gc := &gorillaConn{
 		ws:    ws,
-		msgCh: make(chan wsMessage, 8),
+		msgCh: make(chan wsMessage, 64),
 		done:  make(chan struct{}),
 	}
 	go gc.readPump()
@@ -88,11 +91,31 @@ func (gc *gorillaConn) readPump() {
 	for {
 		kind, data, err := gc.ws.ReadMessage()
 		if err != nil {
+			// 打印底层关闭原因（如 close 1009 message too big / 1006 异常关闭），
+			// 这是判断「服务端拒绝大消息」还是「服务端崩溃」的唯一线索。
+			log.Printf("WS读泵退出: %v", err)
 			return
 		}
+		// 非阻塞投递：channel 满时丢弃消息。
+		// msgCh 只在 Exec 等待结果时被消费，查询结果一定有人读；
+		// 会被丢弃的只有空闲期间积压的心跳 pong——丢弃它们是安全的，
+		// 否则 8 个 pong 塞满 channel 后 readPump 会卡死在投递上。
 		select {
 		case gc.msgCh <- wsMessage{kind: kind, data: data}:
 		case <-gc.done:
+			return
+		default:
+		}
+	}
+}
+
+// drainPending 清空 channel 里积压的旧消息（空闲期间的心跳 pong 等），
+// 在发送新查询前调用，保证随后到达的查询结果不会被非阻塞投递丢弃。
+func (gc *gorillaConn) drainPending() {
+	for {
+		select {
+		case <-gc.msgCh:
+		default:
 			return
 		}
 	}
@@ -112,23 +135,30 @@ func (gc *gorillaConn) ping() error {
 }
 
 // read 阻塞读取一条消息直到 deadline。
+//
+// 注意：绝不能在这里调用 ws.SetReadDeadline —— gorilla 的 deadline 是连接级的，
+// 会影响后台 readPump 正在阻塞的 ReadMessage。若在这里设置 now+120s，
+// 会话空闲 120 秒后 readPump 必然读超时退出、连接死亡（这正是历史上
+// 「websocket: close sent」频繁出现的根因）。查询超时由本函数的 timer 分支实现。
+//
+// 连接已关闭时返回 errClosed，便于调用方区分「本次查询超时」与「会话已失效需重建」。
 func (gc *gorillaConn) read(deadline time.Time) (int, []byte, error) {
-	_ = gc.ws.SetReadDeadline(deadline)
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	select {
 	case m, ok := <-gc.msgCh:
 		if !ok {
-			return 0, nil, websocket.ErrCloseSent
+			return 0, nil, errClosed
 		}
 		return m.kind, m.data, nil
 	case <-timer.C:
 		return 0, nil, errTimeout
 	case <-gc.done:
-		return 0, nil, websocket.ErrCloseSent
+		return 0, nil, errClosed
 	}
 }
 
+// close 关闭连接并标记 done。可重复调用。
 func (gc *gorillaConn) close() {
 	gc.once.Do(func() {
 		close(gc.done)

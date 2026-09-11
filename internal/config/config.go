@@ -28,6 +28,22 @@ type Config struct {
 	Yearning Yearning `yaml:"yearning"`
 
 	Timeout Timeout `yaml:"timeout"`
+
+	Audit Audit `yaml:"audit"`
+}
+
+// Audit 描述请求审计日志的配置，用于抓取客户端（DataGrip）实际发出的
+// metadata 请求并生成「类别 × 处理方式」矩阵。默认关闭。
+type Audit struct {
+	// Enabled 是否启用审计日志。开启后每条命令会追加一行 JSON 到本地文件。
+	Enabled bool `yaml:"enabled"`
+	// Path 审计日志文件路径，相对当前工作目录。
+	Path string `yaml:"path"`
+	// MaxSQL 单条 SQL 记录的最大字符数（按 rune 计），超出截断。
+	MaxSQL int `yaml:"max_sql"`
+	// KeepLiterals 是否在日志里保留 SQL 字面量原文。
+	// 默认 false：长字符串字面量与长数字会被替换成 ?，避免业务数据落盘。
+	KeepLiterals bool `yaml:"keep_literals"`
 }
 
 // Yearning 描述后端 Yearning 服务的连接信息与登录凭据。
@@ -98,6 +114,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Timeout.MetadataCache == 0 {
 		c.Timeout.MetadataCache = 5 * time.Minute
+	}
+	if c.Audit.Path == "" {
+		c.Audit.Path = "sql-relay-audit.jsonl"
+	}
+	if c.Audit.MaxSQL <= 0 {
+		c.Audit.MaxSQL = 512
 	}
 }
 

@@ -5,6 +5,7 @@ package yearning
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/toolsHelp/Yearning-sql-proxy/internal/config"
 	"github.com/toolsHelp/Yearning-sql-proxy/internal/msgpack"
@@ -240,6 +243,7 @@ func (c *Client) sourcesLocked() []Source {
 }
 
 // ResolveSourceID 把 DataGrip 的 user（Yearning 数据源名 source）解析为 source_id。
+// 精确匹配不到时按大小写不敏感再试一次（客户端填写常与后端大小写不一致）。
 func (c *Client) ResolveSourceID(user string) (string, error) {
 	srcs, err := c.Sources()
 	if err != nil {
@@ -247,6 +251,12 @@ func (c *Client) ResolveSourceID(user string) (string, error) {
 	}
 	for _, s := range srcs {
 		if s.Name == user {
+			return s.ID, nil
+		}
+	}
+	lower := strings.ToLower(user)
+	for _, s := range srcs {
+		if strings.ToLower(s.Name) == lower {
 			return s.ID, nil
 		}
 	}
@@ -300,6 +310,10 @@ func (c *Client) SchemaMap() (map[string]string, error) {
 			continue
 		}
 		for _, schema := range schemas {
+			// 系统库不参与路由，否则 DataGrip 的下拉里会多出 information_schema。
+			if isSystemSchema(schema) {
+				continue
+			}
 			// 同名库多个 source 时，保留第一个（可按需改成 source 名优先）。
 			if _, exists := m[schema]; !exists {
 				m[schema] = s.ID
@@ -312,12 +326,46 @@ func (c *Client) SchemaMap() (map[string]string, error) {
 	return cloneMap(m), nil
 }
 
+// AllSourceIDs 返回所有可用数据源 ID（按 source 名排序，保证顺序稳定）。
+func (c *Client) AllSourceIDs() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	names := make([]string, 0, len(c.source))
+	for name := range c.source {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		out = append(out, c.source[name])
+	}
+	return out
+}
+
 // SourceBySchema 返回某个库名对应的 source_id。
+// 精确匹配不到时按大小写不敏感再试一次（MySQL 库名的大小写敏感性随 OS/配置而变）。
 func (c *Client) SourceBySchema(schema string) (string, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	id, ok := c.schemaToSource[schema]
-	return id, ok
+	if id, ok := c.schemaToSource[schema]; ok {
+		return id, true
+	}
+	lower := strings.ToLower(schema)
+	for name, id := range c.schemaToSource {
+		if strings.ToLower(name) == lower {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+// isSystemSchema 判断是否系统库（不参与库名→数据源路由）。
+func isSystemSchema(name string) bool {
+	switch strings.ToLower(name) {
+	case "information_schema", "mysql", "performance_schema", "sys":
+		return true
+	}
+	return false
 }
 
 func cloneMap(src map[string]string) map[string]string {
@@ -359,14 +407,21 @@ func (qs *QuerySession) Exec(sql, schema string) (*msgpack.QueryResults, error) 
 	if err != nil {
 		return nil, err
 	}
+	// 先清掉空闲期间积压的心跳等旧消息，避免随后的查询结果被非阻塞投递丢弃。
+	qs.conn.drainPending()
 	if err := qs.conn.write(payload); err != nil {
+		log.Printf("WS写失败(srcID=%s, payload=%d字节, sql=%d字符): %v",
+			qs.srcID, len(payload), len(sql), err)
 		return nil, err
 	}
 	deadline := time.Now().Add(qs.cfg.Timeout.Query)
 	for {
 		msgType, data, err := qs.conn.read(deadline)
 		if err != nil {
-			log.Printf("WS读失败(srcID=%s): %v", qs.srcID, err)
+			// 带上 SQL 尺寸：长 SQL 若触发 Yearning 服务端的读限制或处理崩溃，
+			// 错误会呈现「发送大消息后连接立即死亡」的确定性特征，据此定位。
+			log.Printf("WS读失败(srcID=%s, payload=%d字节, sql=%d字符): %v",
+				qs.srcID, len(payload), len(sql), err)
 			return nil, err
 		}
 		if msgType != binaryMessage {
@@ -385,12 +440,22 @@ func (qs *QuerySession) Exec(sql, schema string) (*msgpack.QueryResults, error) 
 	}
 }
 
-// keepAlive 每 10s 发文本 "ping" 维持会话，连接关闭时退出。
+// keepAlive 每 10s 发文本 "ping" 维持会话。
+// ping 失败说明连接已不可用，必须主动关闭会话（标记 done），
+// 否则会留下「IsDead() 为 false 但读写都失败」的僵尸会话，
+// 让后续查询反复拿到 websocket 错误。
 func (qs *QuerySession) keepAlive() {
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()
-	for range t.C {
-		if err := qs.conn.ping(); err != nil {
+	for {
+		select {
+		case <-t.C:
+			if err := qs.conn.ping(); err != nil {
+				log.Printf("会话保活失败(srcID=%s)，关闭会话: %v", qs.srcID, err)
+				qs.conn.close()
+				return
+			}
+		case <-qs.conn.done:
 			return
 		}
 	}
@@ -410,6 +475,9 @@ func (qs *QuerySession) IsDead() bool {
 func IsConnError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, errClosed) || errors.Is(err, websocket.ErrCloseSent) {
+		return true
 	}
 	s := err.Error()
 	return strings.Contains(s, "close sent") ||

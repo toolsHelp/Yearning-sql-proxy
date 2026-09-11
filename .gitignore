@@ -10,6 +10,14 @@ config.local.yaml
 # 日志
 *.log
 
+# 审计日志（含 SQL 与库名，勿提交）
+sql-relay-audit*.jsonl
+report.md
+
+# 本地工具生成文件
+.mcp.json
+.mcp.json.*
+
 # 编辑器 / 系统
 .idea/
 .vscode/
