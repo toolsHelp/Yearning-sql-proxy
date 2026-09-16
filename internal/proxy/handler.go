@@ -363,6 +363,15 @@ func (h *Handler) execQuery(query string, ev *audit.Event) (*mysql.Result, audit
 		return r, audit.DecisionLocalEmpty, nil
 	}
 
+	// SHOW CREATE PROCEDURE/FUNCTION：Yearning 解析器不支持 FUNCTION、PROCEDURE
+	// 未限定库名时会路由到错误数据源报 1305，改写为 information_schema 查询后本地拼装。
+	if r, handled, err := h.handleRoutineCreate(q, fw); handled {
+		if err != nil {
+			return nil, audit.DecisionError, err
+		}
+		return r, audit.DecisionLocalServed, nil
+	}
+
 	// 服务器特性探测：优先按伪装版本返回伪造值（SHOW VARIABLES / SELECT @@xx / VERSION() /
 	// DATABASE()）。此前一律返回空结果，客户端拿不到版本号会按未知版本降级。
 	if r, ok := h.fakeProbeResult(q, fw); ok {
