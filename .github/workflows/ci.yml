@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -28,3 +31,77 @@ jobs:
 
       - name: Test
         run: go test -race ./...
+
+  release:
+    # 仅 main 分支 push 触发：打 tag、交叉编译并发布 Release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency: release-${{ github.ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute tag
+        id: tag
+        run: |
+          git fetch --tags --force
+          # HEAD 已被手动打 tag 时沿用该 tag，否则自动递增 patch 版本
+          existing=$(git tag --points-at HEAD | grep -E '^v[0-9]' | head -1 || true)
+          if [ -n "$existing" ]; then
+            tag="$existing"
+          else
+            latest=$(git tag -l 'v*' --sort=-v:refname | head -1 || true)
+            latest=${latest:-v0.0.0}
+            minor=${latest#v*.}; minor=${minor%%.*}
+            major=${latest#v}; major=${major%%.*}
+            patch=${latest##*.}
+            tag="v${major}.${minor}.$((patch + 1))"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "next tag: $tag"
+
+      - name: Push tag
+        run: |
+          git tag "${{ steps.tag.outputs.tag }}"
+          git push origin "${{ steps.tag.outputs.tag }}"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Build artifacts
+        run: |
+          VERSION=${{ steps.tag.outputs.tag }}
+          mkdir -p dist
+          build() {
+            local goos=$1 goarch=$2
+            local name="sql-relay-${VERSION}-${goos}-${goarch}"
+            local out="dist/${name}"
+            if [ "$goos" = "windows" ]; then out="${out}.exe"; fi
+            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch \
+              go build -trimpath -ldflags "-s -w" -o "$out" .
+            if [ "$goos" = "windows" ]; then
+              (cd dist && zip -q "${name}.zip" "${name}.exe")
+            else
+              tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+            fi
+            rm -f "$out"
+          }
+          build linux amd64
+          build linux arm64
+          build darwin amd64
+          build darwin arm64
+          build windows amd64
+          ls -l dist/
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" dist/* \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --notes "自动构建自 commit ${{ github.sha }}" \
+            --target ${{ github.sha }}
