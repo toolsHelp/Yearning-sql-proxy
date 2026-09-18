@@ -47,17 +47,16 @@ jobs:
         id: tag
         run: |
           git fetch --tags --force
-          # HEAD 已被手动打 tag 时沿用该 tag，否则自动递增 patch 版本
+          # HEAD 已被手动打 tag 时沿用该 tag，否则自动递增 minor 版本
           existing=$(git tag --points-at HEAD | grep -E '^v[0-9]' | head -1 || true)
           if [ -n "$existing" ]; then
             tag="$existing"
           else
             latest=$(git tag -l 'v*' --sort=-v:refname | head -1 || true)
             latest=${latest:-v0.0.0}
-            minor=${latest#v*.}; minor=${minor%%.*}
             major=${latest#v}; major=${major%%.*}
-            patch=${latest##*.}
-            tag="v${major}.${minor}.$((patch + 1))"
+            minor=${latest#v*.}; minor=${minor%%.*}
+            tag="v${major}.$((minor + 1)).0"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "next tag: $tag"
