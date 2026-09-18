@@ -3,7 +3,6 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -12,8 +11,6 @@ permissions:
 
 jobs:
   build:
-    # 检查job：PR 与 main 分支 push 触发（tag push 不重复跑）
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,13 +33,39 @@ jobs:
         run: go test -race ./...
 
   release:
-    # 发布job：push v* tag 触发，版本号以 tag 为准
-    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
+    # 仅 main 分支 push 触发：打 tag、交叉编译并发布 Release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
     runs-on: ubuntu-latest
+    concurrency: release-${{ github.ref }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Compute tag
+        id: tag
+        run: |
+          git fetch --tags --force
+          # HEAD 已被手动打 tag 时沿用该 tag，否则自动递增 patch 版本
+          existing=$(git tag --points-at HEAD | grep -E '^v[0-9]' | head -1 || true)
+          if [ -n "$existing" ]; then
+            tag="$existing"
+          else
+            latest=$(git tag -l 'v*' --sort=-v:refname | head -1 || true)
+            latest=${latest:-v0.0.0}
+            minor=${latest#v*.}; minor=${minor%%.*}
+            major=${latest#v}; major=${major%%.*}
+            patch=${latest##*.}
+            tag="v${major}.${minor}.$((patch + 1))"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "next tag: $tag"
+
+      - name: Push tag
+        run: |
+          git tag "${{ steps.tag.outputs.tag }}"
+          git push origin "${{ steps.tag.outputs.tag }}"
 
       - uses: actions/setup-go@v5
         with:
@@ -51,7 +74,7 @@ jobs:
 
       - name: Build artifacts
         run: |
-          VERSION=${GITHUB_REF_NAME}
+          VERSION=${{ steps.tag.outputs.tag }}
           mkdir -p dist
           build() {
             local goos=$1 goarch=$2
@@ -78,16 +101,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION=${GITHUB_REF_NAME}
-          prev=$(git tag -l 'v*' --sort=-v:refname | grep -vx "$VERSION" | head -1 || true)
-          {
-            echo "## 更新内容"
-            if [ -n "$prev" ]; then
-              git log --oneline "$prev..$VERSION" | sed 's/^/- /'
-            else
-              echo "- 首个版本"
-            fi
-          } > notes.md
-          gh release create "$VERSION" dist/* \
-            --title "$VERSION" \
-            --notes-file notes.md
+          gh release create "${{ steps.tag.outputs.tag }}" dist/* \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --notes "自动构建自 commit ${{ github.sha }}" \
+            --target ${{ github.sha }}
