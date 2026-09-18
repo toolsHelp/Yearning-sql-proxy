@@ -55,6 +55,11 @@ func dial(url, token, origin string, timeout time.Duration) (*gorillaConn, error
 	header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36")
 	dialer := &websocket.Dialer{
 		HandshakeTimeout: timeout,
+		// 关键：Yearning 服务端的 x/net/websocket 不会合并 continuation 分帧，
+		// 每个分片会被当作独立消息交给 msgpack 解码，导致大 SQL 解码失败、
+		// 会话被关闭（表现为查询后立即 close 1000）。gorilla 默认写缓冲 4096
+		// 字节，超过就自动分帧——必须调大缓冲让消息保持单帧（浏览器即单帧直发）。
+		WriteBufferSize: 1 << 20,
 	}
 	ws, resp, err := dialer.Dial(url, header)
 	if err != nil {
