@@ -178,7 +178,7 @@ The binary is statically compiled: distributing it requires only the executable 
 |---|---|
 | Host | `127.0.0.1` |
 | Port | `3307` (same as `listen` in the config) |
-| User | a Yearning data source name (e.g. `gaia_purchase_order`) — the default source for unqualified queries |
+| User | a Yearning data source name (e.g. `xx_order`) — the default source for unqualified queries |
 | Password | `proxy_password` |
 | Driver | any MySQL driver (the proxy advertises 5.7) |
 

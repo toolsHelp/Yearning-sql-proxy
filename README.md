@@ -158,7 +158,7 @@ GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -o sql-relay-darwin-amd64 .
 |---|---|
 | Host | `127.0.0.1` |
 | Port | `3307`（与 config 一致） |
-| User | Yearning 数据源名（如 `gaia_purchase_order`），作为无库名前缀查询时的默认数据源 |
+| User | Yearning 数据源名（如 `xx_order`），作为无库名前缀查询时的默认数据源 |
 | Password | `proxy_password` |
 | Driver | 任意 MySQL 驱动（代理伪装为 5.7） |
 
